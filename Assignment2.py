@@ -1,11 +1,11 @@
 import copy
-
-import matplotlib
 import numpy as np
 import pickle
+import matplotlib
 import matplotlib.pyplot as plt
 from torch_gradient_computations import ComputeGradsWithTorch
-matplotlib.use('Qt5Agg')  # Use the Qt5Agg backend for better performance
+
+matplotlib.use('Qt5Agg') 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -15,91 +15,135 @@ def LoadBatch(batch_number):
         filename = f'./Datasets/cifar-10-batches-py/test_batch'
     with open(filename, 'rb') as fo:
         data = pickle.load(fo, encoding='bytes') 
-    imagePixelData = data[b'data'].astype(np.float64) / 255.0  # Normalize pixel values to [0, 1]
-    imageLabels = np.array(data[b'labels'])  # Convert labels to a numpy array
-    oneHotRep = np.zeros((10, len(imageLabels)))  # Create a zero matrix for one-hot encoding
-    oneHotRep[imageLabels, np.arange(len(imageLabels))] = 1  # Set the appropriate entries to 1
-    print(imagePixelData.shape, oneHotRep.shape, imageLabels.shape)  # Print the shapes of the loaded data
+    
+    imagePixelData = data[b'data'].astype(np.float64) / 255.0 
+    imageLabels = np.array(data[b'labels']) 
+    
+    oneHotRep = np.zeros((10, len(imageLabels))) 
+    oneHotRep[imageLabels, np.arange(len(imageLabels))] = 1 
+    
     return imagePixelData, oneHotRep, imageLabels
 
+def computeMeanStd(train_data):
+    """Computes the mean and std on the training data ONLY."""
+    mean_X = np.mean(train_data, axis=0, keepdims=True)
+    std_X = np.std(train_data, axis=0, keepdims=True)
+    return mean_X, std_X
+
+def normalizeData(data, mean_X, std_X):
+    """Applies pre-computed mean and std to normalize data."""
+    return (data - mean_X) / std_X
+
 def softmax(x):
-    # x shape: (k, N) where k is number of classes and N is number of samples
-    # Stable softmax along the class dimension for each sample
     z = x - np.max(x, axis=0, keepdims=True)
     e = np.exp(z)
     return e / np.sum(e, axis=0, keepdims=True)
 
-def normalizeData(imagePixelData, d):
-    # imagePixelData shape: (num_images, d)
-    mean_X = np.mean(imagePixelData, axis=0).reshape(1, d)  # Compute the mean of each pixel across all images
-    std_X = np.std(imagePixelData, axis=0).reshape(1, d) # Compute the standard deviation of each pixel across all images
-    normalized_X = (imagePixelData - mean_X) / std_X  # Normalize the pixel values
-
-    return normalized_X
-
-def initializeWeights(k, d, seed = 42):
-    np.random.seed(seed) # Set the random seed according to assignment instructions
-    weights = np.random.rand(k, d) * 0.01  # Initialize weights with small random values
+def initializeWeights(k, d, seed=42):
+    np.random.seed(seed) 
+    weights = np.random.normal(0, 1/np.sqrt(d), (k, d))  
     return weights
 
 def initializeBias(k):
-    bias = np.zeros((k, 1))  # Initialize bias with zeros
+    bias = np.zeros((k, 1)) 
     return bias
 
-def initializeModel(k, d, seed = 42):
-    weights = initializeWeights(k, d, seed)  # Initialize weights
-    bias = initializeBias(k)  # Initialize bias
-    model = {"weights": weights, "bias": bias}  # Create a dictionary to store weights and bias
+def initializeModel(dims, seed=42):
+    model = [dict()] * len(dims) 
+    for i, dim in enumerate(dims):
+        if dim[0] <= 0 or dim[1] <= 0:
+            raise ValueError("Dimensions must be positive integers.")
+        
+        weights = initializeWeights(dim[0], dim[1], seed) 
+        bias = initializeBias(dim[0]) 
+        model[i] = {"weights": weights, "bias": bias} 
     return model
 
-def applyNetwork(pixelData, model):
-    weights = model["weights"]  # Extract weights from the model
-    bias = model["bias"]  # Extract bias from the model
-    z = np.matmul(weights, pixelData.T) + bias  # Compute the output of the network using the softmax function per row
-    outputProbs = softmax(z)  # Apply softmax to the output of the network
-
-    return outputProbs
-
-def lcross(labels, outputProbs, onehot: bool = False):
-    epsilon = 1e-15  # Small constant to prevent log(0)
-    safe_outputProbs = outputProbs + epsilon  # Clip output probabilities to prevent log(0)
-    if onehot:
-        lcross = -labels * np.log(safe_outputProbs)  # Compute the cross-entropy loss using one-hot encoded labels
+def applyLayer(pixelData, layer, apply_relu=True):
+    weights = layer["weights"] 
+    bias = layer["bias"] 
+    
+    z = np.matmul(weights, pixelData) + bias 
+    
+    if apply_relu:
+        a = np.maximum(z, 0) 
     else:
-        lcross = -np.log(safe_outputProbs[labels, np.arange(labels.shape[0])])  # Compute the cross-entropy loss using integer labels
-    return lcross  # Return lcross
+        a = softmax(z) 
 
-def computeLoss(outputProbs, model, labels, l, onehot: bool = False):
-    sum1 = np.sum(lcross(labels, outputProbs, onehot))  # Compute the sum of the cross-entropy loss
-    sum2 = np.sum(model["weights"] ** 2)  # Compute the regularization term
+    return z, a 
 
-    N = outputProbs.shape[1]  # Get the number of samples
+def applyNetwork(pixelData, model):
+    activations = pixelData.T 
+    z_values = [] 
+    a_values = [activations] 
+    
+    for i, layer in enumerate(model):
+
+        is_hidden_layer = (i < len(model) - 1)
+        z, a = applyLayer(activations, layer, apply_relu=is_hidden_layer)  
+        z_values.append(z)
+        a_values.append(a)
+        activations = a
+    
+    return z_values, a_values
+
+def lcross(labels, finalPredictions, onehot: bool = False):
+    epsilon = 1e-15 
+    safe_outputProbs = np.clip(finalPredictions, epsilon, 1.0 - epsilon) 
+    
+    if onehot:
+        lcross_val = -np.sum(labels * np.log(safe_outputProbs), axis=0) 
+    else:
+
+        lcross_val = -np.log(safe_outputProbs[labels, np.arange(labels.shape[0])]) 
+    return lcross_val  
+
+def computeLoss(z_values, a_values, model, labels, l, onehot: bool = False):
+
+    sum1 = np.sum(lcross(labels, a_values[-1], onehot)) 
+    
+    sum2 = 0
+    for layer in model:
+        sum2 += np.sum(layer["weights"] ** 2) 
+
+    N = a_values[-1].shape[1] 
     total_loss = (1/N) * sum1 + l * sum2  
-    return total_loss  # Return the total loss
+    return total_loss 
 
-def getPredictedLabels(outputProbs):
-    predicted_labels = np.argmax(outputProbs, axis=0)  # Get the predicted labels by taking the argmax of the output probabilities
+def getPredictedLabels(z_values, a_values):
+    predicted_labels = np.argmax(a_values[-1], axis=0) 
     return predicted_labels
 
 def computeAccuracy(predicted_labels, labels):
-    accuracy = np.mean(predicted_labels == labels)  # Compute the accuracy by comparing predicted labels with true labels
-    return accuracy  # Return the accuracy
+    accuracy = np.mean(predicted_labels == labels) 
+    return accuracy 
 
-def BackwardPass(pixelData, outputProbs, model, labels, l, onehot: bool = False):
+def BackwardPass(z_values, a_values, model, labels, l):
+    L = len(model) 
+    N = a_values[-1].shape[1] 
+    
+    grads = [None] * L 
+    
+    # LAYER L-1 (Output layer with softmax)
+    dL_dz = a_values[-1].copy() 
+    dL_dz[labels.flatten(), np.arange(N)] -= 1 
+    
+    dL_dw = (1/N) * np.matmul(dL_dz, a_values[-2].T) + 2 * l * model[-1]["weights"]
+    dL_db = (1/N) * np.sum(dL_dz, axis=1, keepdims=True)
+    grads[-1] = {"weights": dL_dw, "bias": dL_db}
+    
+    # BACKPROPAGATE through earlier layers
+    for i in range(L-2, -1, -1):
+        dL_da = np.matmul(model[i+1]["weights"].T, dL_dz)
+        dL_dz = dL_da * (z_values[i] > 0)
+        
+        dL_dw = (1/N) * np.matmul(dL_dz, a_values[i].T) + 2 * l * model[i]["weights"]
+        dL_db = (1/N) * np.sum(dL_dz, axis=1, keepdims=True)
+        grads[i] = {"weights": dL_dw, "bias": dL_db}
+    
+    return grads
 
-    N = pixelData.shape[0]  # Get the number of samples
-    if onehot:
-        dL_dz = outputProbs - labels  # Compute the gradient of the loss with respect to the output probabilities for one-hot encoded labels
-    else:
-        dL_dz = outputProbs.copy()  # Copy the output probabilities
-        dL_dz[labels, np.arange(N)] -= 1  # Subtract 1 from the appropriate entries for integer labels
-
-    dL_dw = (1/N) * np.matmul(dL_dz, pixelData) + 2 * l * model["weights"]  # Compute the gradient of the loss with respect to the weights
-    dL_db = (1/N) * np.sum(dL_dz, axis=1, keepdims=True)  # Compute the gradient of the loss with respect to the bias
-
-    return dL_dw, dL_db  # Return the gradients
-
-def relativeError(grad1, grad2, eps = 1e-8):
+def relativeError(grad1, grad2, eps=1e-8):
     nominator = np.abs(grad1 - grad2)
     if np.sum(np.abs(grad1)) + np.sum(np.abs(grad2)) < eps:
         return np.abs(grad1 - grad2)/eps
@@ -108,168 +152,144 @@ def relativeError(grad1, grad2, eps = 1e-8):
         return nominator/denominator  
 
 def miniBatchGradientDescent(
-        X_train,
-        labels_train,
-        X_val,
-        labels_val,
-        n_batch, # number of images per batch
-        learningRate, 
-        n_epochs, # number of epochs to train the model
-        model, # model is a dict with keys "weights" and "bias"
-        lam, # regularization parameter
-        seed = 42
-        ): 
+        X_train, labels_train, X_val, labels_val, n_batch, 
+         n_epochs, model, lam, learningRateCalc="static", seed=42): 
     
-    n = X_train.shape[0] # number of training samples
-    model_trained = copy.deepcopy(model) # create a copy of the model to update during training
+    n = X_train.shape[0] 
+    model_trained = copy.deepcopy(model) 
 
-    train_costs = []  # Initialize a list to store the cost
-    val_costs = []  # Initialize a list to store the validation cost
-
-    train_losses = []  # Initialize a list to store the training loss
-    val_losses = []  # Initialize a list to store the validation loss
+    train_costs, val_costs = [], []
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    update_steps = []
 
     for epoch in range(n_epochs):
         rng = np.random.RandomState(seed + epoch)
-        shuffled_indices = rng.permutation(n) # shuffle the indices
+        shuffled_indices = rng.permutation(n) 
 
-        for i in range(n//n_batch):
+        for i in range(n // n_batch):
+            i_start = i * n_batch 
+            i_end = (i+1) * n_batch 
+            inds = np.arange(i_start, i_end) 
 
-            i_start = i * n_batch # first elemnt of batch
-            i_end = (i+1) * n_batch # last element of batch
-            inds = np.arange(i_start, i_end) # indices of the batch
-            x_batch = X_train[shuffled_indices[inds], :] # batch of pixel inputdata
-            y_batch = labels_train[shuffled_indices[inds]] # batch of labels
-            outputprobs_batch = applyNetwork(x_batch, model_trained) # compute output probabilities for the batch
+            t = epoch * n//n_batch + i # update step, saved for plotting
 
-            dL_dw, dL_db = BackwardPass(x_batch, outputprobs_batch, model_trained, y_batch, l=lam, onehot=False) # compute gradients for the batch
-            model_trained["weights"] -= learningRate * dL_dw # update weights
-            model_trained["bias"] -= learningRate * dL_db # update bias
+            if learningRateCalc == "cyclical":
+                learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=500, t=t)
+            else:
+                learningRate = 1e-3  # static learning rate
 
-        train_outputprobs = applyNetwork(X_train, model_trained)  # Apply the network to the entire training data at the end of each epoch
+            x_batch = X_train[shuffled_indices[inds], :] 
+            y_batch = labels_train[shuffled_indices[inds]] 
+            
+            z_batch, a_batch = applyNetwork(x_batch, model_trained) 
+            grads = BackwardPass(z_batch, a_batch, model_trained, y_batch, l=lam) 
+            
+            for layer_idx in range(len(model_trained)):
+                model_trained[layer_idx]["weights"] -= learningRate * grads[layer_idx]["weights"]
+                model_trained[layer_idx]["bias"] -= learningRate * grads[layer_idx]["bias"]
 
-        train_cost = computeLoss(train_outputprobs, model_trained, labels_train, l=lam, onehot=False) # compute cost at the end of each epoch
-        train_costs.append(train_cost) 
+        # Record the current update step (which is the total steps taken up to this point)
+        current_step = (epoch + 1) * (n // n_batch)
+        update_steps.append(current_step)
 
-        train_loss = computeLoss(train_outputprobs, model_trained, labels_train, l=0, onehot=False)  # compute training loss
-        train_losses.append(train_loss) 
+        # Evaluate Training Data
+        z_train, a_train = applyNetwork(X_train, model_trained) 
+        train_costs.append(computeLoss(z_train, a_train, model_trained, labels_train, l=lam)) 
+        train_losses.append(computeLoss(z_train, a_train, model_trained, labels_train, l=0)) 
+        train_accs.append(computeAccuracy(getPredictedLabels(z_train, a_train), labels_train))
 
-        val_outputprobs = applyNetwork(X_val, model_trained)  # Apply the network to the entire validation data
-        val_cost = computeLoss(val_outputprobs, model_trained, labels_val, l=lam, onehot=False)  # compute validation cost
-        val_costs.append(val_cost)  
+        # Evaluate Validation Data
+        z_val, a_val = applyNetwork(X_val, model_trained) 
+        val_costs.append(computeLoss(z_val, a_val, model_trained, labels_val, l=lam))  
+        val_losses.append(computeLoss(z_val, a_val, model_trained, labels_val, l=0)) 
+        val_accs.append(computeAccuracy(getPredictedLabels(z_val, a_val), labels_val))
 
-        val_loss = computeLoss(val_outputprobs, model_trained, labels_val, l=0, onehot=False)  # compute validation loss
-        val_losses.append(val_loss)
+    return model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps 
 
-    return model_trained, train_costs, val_costs, train_losses, val_losses # return the updated model after training
-
-
+def computeCyclicalLearningRate(eta_min, eta_max, n_s, t):
+    l = t // (2 * n_s)
+    if 2*l*n_s <= t <= (2*l+1)*n_s:
+        learningRate = eta_min + ((t - 2*l*n_s) / n_s) * (eta_max - eta_min)
+    else:        
+        learningRate = eta_max - ((t - (2*l+1)*n_s) / n_s) * (eta_max - eta_min)
+    return learningRate
 
 def main():
-
-    train_X, _, train_y = LoadBatch(1) # Load training data from the cifar-10 dataset
-    train_X = normalizeData(train_X, train_X.shape[1]) # Normalize the training data
+    train_X, _, train_y = LoadBatch(1) 
+    mean_X, std_X = computeMeanStd(train_X)
+    train_X = normalizeData(train_X, mean_X, std_X) 
     print("Training data loaded and normalized.")
 
     val_X, _, val_y = LoadBatch(2) 
-    val_X = normalizeData(val_X, val_X.shape[1]) 
+    val_X = normalizeData(val_X, mean_X, std_X) 
     print("Validation data loaded and normalized.")
 
     test_X, _, test_y = LoadBatch(5)
-    test_X = normalizeData(test_X, test_X.shape[1])
+    test_X = normalizeData(test_X, mean_X, std_X)
     print("Test data loaded and normalized.")
 
-    model = initializeModel(len(np.unique(train_y)), train_X.shape[1]) # Initialize the model as a dict
+    m = 50 
+    dims = [[m, train_X.shape[1]],
+            [len(np.unique(train_y)), m]]  
+    model = initializeModel(dims) 
     print("Model initialized with weights and bias.")
 
-    output = applyNetwork(train_X, model)  # Apply the network to the training data
-    print("Network applied to training data.")
-
-    cross_entropy_loss = computeLoss(output, model, train_y, l=0.01, onehot=False)  # Compute the cross-entropy loss
+    z_output, a_output = applyNetwork(train_X, model) 
+    cross_entropy_loss = computeLoss(z_output, a_output, model, train_y, l=0.01) 
     print(f"Cross-entropy loss computed: {cross_entropy_loss}")
 
-    get_predicted_labels = getPredictedLabels(output)  # Get the predicted labels from the output probabilities
-    print("Predicted labels obtained from output probabilities.")
-
-    accuracy = computeAccuracy(get_predicted_labels, train_y)  # Compute the accuracy of the predictions
+    get_predicted_labels = getPredictedLabels(z_output, a_output) 
+    accuracy = computeAccuracy(get_predicted_labels, train_y) 
     print(f"Accuracy computed: {accuracy}")
 
-    dL_dw, dL_db = BackwardPass(train_X, output, model, train_y, l=0.01, onehot=False)  # Compute the gradients
+    grads = BackwardPass(z_output, a_output, model, train_y, l=0.01) 
     print("Gradients computed.")
 
-    _, torch_gradients = ComputeGradsWithTorch(train_X, train_y, model)  # Compute gradients using PyTorch for comparison
-    tgW = torch_gradients['weights']  # Extract the gradient of the weights from PyTorch
-    tgb = torch_gradients['bias']  # Extract the gradient of the bias from PyTorch
+    torch_gradients = ComputeGradsWithTorch(train_X.T, train_y, model, lam=0.01)  
+    tgW_0 = torch_gradients[0]['weights_grad'] 
+    tgb_0 = torch_gradients[0]['bias_grad']  
 
-    # Absolute difference between my gradients and the torch gradients
-    abs_diff_W = np.abs(dL_dw - tgW)  
-    abs_diff_b = np.abs(dL_db - tgb)  
-    print(f'Absolute difference in gradients for weights: {abs_diff_W}')
-    print(f'Absolute difference in gradients for bias: {abs_diff_b}')
+    tgW_1 = torch_gradients[1]['weights_grad']  
+    tgb_1 = torch_gradients[1]['bias_grad']  
 
-    # Relative error between my gradients and the torch gradients
-    rel_error_W = relativeError(dL_dw, tgW)
-    rel_error_b = relativeError(dL_db, tgb)
-    print(f'Relative error in gradients for weights: {rel_error_W}')
-    print(f'Relative error in gradients for bias: {rel_error_b}')
+    print(f"Relative error in gradients for layer 0 weights: {np.max(relativeError(grads[0]['weights'], tgW_0))}")
+    print(f"Relative error in gradients for layer 0 bias: {np.max(relativeError(grads[0]['bias'], tgb_0))}")
+    print(f"Relative error in gradients for layer 1 weights: {np.max(relativeError(grads[1]['weights'], tgW_1))}")
+    print(f"Relative error in gradients for layer 1 bias: {np.max(relativeError(grads[1]['bias'], tgb_1))}")
 
-    trained_model, train_costs, val_costs, train_losses, val_losses = miniBatchGradientDescent(
-        X_train=train_X,
-        labels_train=train_y,
-        X_val=val_X,
-        labels_val=val_y,
-        n_batch=100,
-        learningRate=0.1,
-        n_epochs=40,
-        model=model,
-        lam=0,
-        seed=42)
+    trained_model, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescent(
+        train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=10, model=model, lam=0.01, seed=42)
+    print("Mini-batch gradient descent completed.")
 
-    # Plot the cost over epochs
-    plt.plot(train_costs, label='Training Cost')
-    plt.plot(val_costs, label='Validation Cost')
-    plt.xlabel('Epoch')
-    plt.ylabel('Cost')
-    plt.title('Cost over Epochs')
-    plt.legend()
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5)) # Create 1 row with 3 columns
+
+    # Cost Plot
+    axs[0].plot(update_steps, train_costs, label='training cost', color='teal')
+    axs[0].plot(update_steps, val_costs, label='validation cost', color='crimson')
+    axs[0].set_xlabel('update step')
+    axs[0].set_ylabel('cost')
+    axs[0].set_title('Cost plot')
+    axs[0].legend()
+
+    # Loss Plot
+    axs[1].plot(update_steps, train_losses, label='training loss', color='teal')
+    axs[1].plot(update_steps, val_losses, label='validation loss', color='crimson')
+    axs[1].set_xlabel('update step')
+    axs[1].set_ylabel('loss')
+    axs[1].set_title('Loss plot')
+    axs[1].legend()
+
+    # Accuracy Plot
+    axs[2].plot(update_steps, train_accs, label='training accuracy', color='teal')
+    axs[2].plot(update_steps, val_accs, label='validation accuracy', color='crimson')
+    axs[2].set_xlabel('update step')
+    axs[2].set_ylabel('accuracy')
+    axs[2].set_title('Accuracy plot')
+    axs[2].legend()
+
+    plt.tight_layout() # fix layout
     plt.show()
-
-    # Plot the loss over epochs
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Loss over Epochs')
-    plt.legend()
-    plt.show()
-
-    Ws = trained_model['weights'].transpose().reshape((32, 32, 3, 10), order='F')
-    W_im = np.transpose(Ws, (1, 0, 2, 3))
-    for i in range(10):
-        plt.figure()
-        w_im = W_im[:, :, :, i]
-        w_im_norm = (w_im - np.min(w_im)) / (np.max(w_im) - np.min(w_im))
-        plt.imshow(w_im_norm)
-        plt.title(f'Visualization of Weights for Class {i}')
-        plt.savefig(f'./images/class_{i}.png')
-        plt.close()
-
-    
-
-    final_output_train = applyNetwork(train_X, trained_model)
-    final_predicted_labels_train = getPredictedLabels(final_output_train)
-    final_accuracy_train = computeAccuracy(final_predicted_labels_train, train_y)
-    print(f"Final accuracy after training: {final_accuracy_train}")
-
-    final_output_validation = applyNetwork(val_X, trained_model)
-    final_predicted_labels_validation = getPredictedLabels(final_output_validation)
-    final_accuracy_validation = computeAccuracy(final_predicted_labels_validation, val_y)
-    print(f"Final accuracy on validation set: {final_accuracy_validation}")
-
-    final_output_test = applyNetwork(test_X, trained_model)
-    final_predicted_labels_test = getPredictedLabels(final_output_test)
-    final_accuracy_test = computeAccuracy(final_predicted_labels_test, test_y)
-    print(f"Final accuracy on test set: {final_accuracy_test}")
 
 
 if __name__ == "__main__":
