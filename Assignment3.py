@@ -1,9 +1,10 @@
 import copy
+import time
 import numpy as np
 import pickle
 import matplotlib
 import matplotlib.pyplot as plt
-from torch_gradient_computations import ComputeGradsWithTorch
+from torch_gradient_computations import ComputeGradsWithTorch, ComputePytorchGradientsConv
 
 matplotlib.use('Qt5Agg') 
 import warnings
@@ -31,8 +32,9 @@ def debug_data_load():
     n = X.shape[1]
     X_ims = np.transpose(X.reshape((32, 32, 3, n), order='F'), (1, 0, 2, 3))
 
-    true_labels = load_data['conv_outputs']
-    return X_ims, Fs, true_labels
+    true_convolutions = load_data['conv_outputs']
+    true_labels = load_data['Y']
+    return X_ims, Fs, true_convolutions, true_labels
 
 def computeMeanStd(train_data):
     """Computes the mean and std on the training data ONLY."""
@@ -119,13 +121,26 @@ def initializeModel(dims, seed=42):
     return model
 
 def initializeConvModel(filter_dims, num_filters, num_hidden, num_labels, num_patches, seed=42):
-
-    filter_vector = np.random.normal(0, 2/np.sqrt(filter_dims[0] * filter_dims[1] * 3), (num_filters, filter_dims[0] * filter_dims[1] * 3))
+    np.random.seed(seed)
+    
+    f = filter_dims[0]
+    
+    # Convolutional Layer, single patch (f * f * 3)
+    fan_in_conv = f * f * 3
+    # Shape: (3*f*f, num_filters)
+    filter_vector = np.random.normal(0, np.sqrt(2/fan_in_conv), (fan_in_conv, num_filters))
     filter_bias_vector = np.zeros((num_filters, 1))
-    l1_weights_hidden = initializeWeights(num_hidden, (num_filters*num_patches), seed)
-    l1_bias_hidden = initializeBias(num_filters*num_patches)
-    l2_weights_hidden = initializeWeights(num_labels, num_hidden, seed)
-    l2_bias_hidden = initializeBias(num_labels)
+    
+    # Hidden Layer
+    # Fan-in is the total number of activations coming from the flattened conv layer
+    fan_in_hidden = num_filters * num_patches
+    l1_weights_hidden = np.random.normal(0, np.sqrt(2/fan_in_hidden), (num_hidden, fan_in_hidden))
+    l1_bias_hidden = np.zeros((num_hidden, 1))
+    
+    # Output Layer fan-in is the number of hidden nodes
+    fan_in_output = num_hidden
+    l2_weights_hidden = np.random.normal(0, np.sqrt(2/fan_in_output), (num_labels, num_hidden))
+    l2_bias_hidden = np.zeros((num_labels, 1))
 
     return {
         "conv_layer": {"weights": filter_vector, "bias": filter_bias_vector},
@@ -220,13 +235,111 @@ def BackwardPass(z_values, a_values, model, labels, l):
     
     return grads
 
+def BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, labels, l):
+    N = p.shape[1]
+    n_p = MX.shape[0]
+    nf = conv_model["conv_layer"]["weights"].shape[1] 
+
+    # LAYER L-1 (Output layer with softmax)
+    g = p.copy()
+    g[labels.flatten(), np.arange(N)] -= 1
+    
+    dL_dW2 = (1/N) * np.matmul(g, x1.T) + 2 * l * conv_model["output_layer"]["weights"]
+    dL_db2 = (1/N) * np.sum(g, axis=1, keepdims=True)
+    
+    # LAYER L-2 (Hidden layer)
+    g = np.matmul(conv_model["output_layer"]["weights"].T, g)
+    g = g * (z1 > 0) # ReLU derivative
+    
+    dL_dW1 = (1/N) * np.matmul(g, conv_flat_activated.T) + 2 * l * conv_model["hidden_layer"]["weights"]
+    dL_db1 = (1/N) * np.sum(g, axis=1, keepdims=True)
+    
+    # LAYER L-3 (Convolutional layer)
+    g = np.matmul(conv_model["hidden_layer"]["weights"].T, g)
+    
+    # G_batch represents the flattened conv output gradient 
+    G_batch = g * (conv_flat_activated > 0) # ReLU derivative for conv layer
+    GG = G_batch.reshape((n_p, nf, N), order='C')
+    MXt = np.transpose(MX, (1, 0, 2))
+    
+    # Compute gradient for flattened filters using Einsum
+    dL_dF_flat = (1/N) * np.einsum('ijn, jln ->il', MXt, GG, optimize=True) 
+    dL_dW_conv = dL_dF_flat + 2 * l * conv_model["conv_layer"]["weights"]   #shape: (3*f*f, num_filters)
+    dL_db_conv = (1/N) * np.sum(GG, axis=(0, 2)).reshape(-1, 1)
+    
+    # Return gradients
+    return {
+        "conv_layer": {"weights": dL_dW_conv, "bias": dL_db_conv},
+        "hidden_layer": {"weights": dL_dW1, "bias": dL_db1},
+        "output_layer": {"weights": dL_dW2, "bias": dL_db2}
+    }
+
 def relativeError(grad1, grad2, eps=1e-8):
     nominator = np.abs(grad1 - grad2)
-    if np.sum(np.abs(grad1)) + np.sum(np.abs(grad2)) < eps:
-        return np.abs(grad1 - grad2)/eps
-    else:
-        denominator = np.abs(grad1) + np.abs(grad2)
-        return nominator/denominator  
+    denominator = np.maximum(eps, np.abs(grad1) + np.abs(grad2))
+    return nominator / denominator
+
+
+def miniBatchGradientDescentConv(
+        MX_train, labels_train_flat, MX_val, labels_val_flat, n_batch, 
+         n_epochs, conv_model, lam, n_s = 500, seed=42): 
+    
+    n = MX_train.shape[2] 
+    model_trained = copy.deepcopy(conv_model) 
+
+    train_costs, val_costs = [], []
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    update_steps = []
+    
+    start_time = time.time()
+
+    for epoch in range(n_epochs):
+        rng = np.random.RandomState(seed + epoch)
+        shuffled_indices = rng.permutation(n) 
+
+        for i in range(n // n_batch):
+            i_start = i * n_batch 
+            i_end = (i+1) * n_batch 
+            inds = np.arange(i_start, i_end) 
+            t = epoch * (n // n_batch) + i 
+
+            learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=n_s, t=t)
+
+            # Slice the MX batch (shape is n_p, 3*f*f, n) => slice on the 3rd axis
+            mx_batch = MX_train[:, :, shuffled_indices[inds]] 
+            y_batch = labels_train_flat[shuffled_indices[inds]] 
+            
+            # Forward and Backward pass
+            conv_flat_activated, x1, p, z1, z2 = conv_forward_pass(mx_batch, model_trained)
+            grads = BackwardPassConv(mx_batch, conv_flat_activated, x1, p, z1, model_trained, y_batch, l=lam) 
+            
+            # Update parameters
+            for layer_name in model_trained.keys():
+                model_trained[layer_name]["weights"] -= learningRate * grads[layer_name]["weights"]
+                model_trained[layer_name]["bias"] -= learningRate * grads[layer_name]["bias"]
+
+        current_step = (epoch + 1) * (n // n_batch)
+        update_steps.append(current_step)
+
+        # Evaluate Validation Data at the end of each epoch
+        _, _, p_val, _, _ = conv_forward_pass(MX_val, model_trained) 
+        
+        # adapt computeLoss logic here for the CNN
+        val_loss = np.mean(-np.log(np.clip(p_val[labels_val_flat, np.arange(len(labels_val_flat))], 1e-15, 1.0 - 1e-15)))
+        val_losses.append(val_loss)
+        
+        l2_reg = lam * (np.sum(model_trained["conv_layer"]["weights"]**2) + np.sum(model_trained["hidden_layer"]["weights"]**2) + np.sum(model_trained["output_layer"]["weights"]**2))
+        val_costs.append(val_loss + l2_reg) 
+        
+        val_accs.append(computeAccuracy(np.argmax(p_val, axis=0), labels_val_flat))
+        
+        print(f"Epoch {epoch+1}/{n_epochs} | Val Acc: {val_accs[-1]*100:.2f}% | Val Cost: {val_costs[-1]:.4f}")
+
+    end_time = time.time()
+    print(f"Training completed in {end_time - start_time:.2f} seconds.")
+
+    return model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps
 
 def miniBatchGradientDescent(
         X_train, labels_train, X_val, labels_val, n_batch, 
@@ -284,11 +397,14 @@ def miniBatchGradientDescent(
 
     return model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps 
 
-def conv_forward_pass(MX, flattened_Fs, conv_model, stride=4):
+def conv_forward_pass(MX, conv_model, stride=4):
     n_p = MX.shape[0]
     n = MX.shape[2]
+    flattened_Fs = conv_model["conv_layer"]["weights"]
+
     nf = flattened_Fs.shape[1]
     conv_out = convolutional_layer_calculation(MX, flattened_Fs, stride=stride)
+    conv_out += conv_model["conv_layer"]["bias"].reshape((1, nf, 1))
     conv_flat_activated = np.fmax(conv_out.reshape((n_p*nf, n), order='C'), 0)
 
     z1, x1 = applyLayer(conv_flat_activated, conv_model["hidden_layer"], apply_relu=True)
@@ -334,7 +450,7 @@ def main():
 
 
 
-    X_ims_debug, Fs_debug, true_convolutions_debug = debug_data_load()
+    X_ims_debug, Fs_debug, true_convolutions_debug, true_labels_debug = debug_data_load()
     # print(f'Debug data shapes - X_ims: {X_ims_debug.shape}, Fs: {Fs_debug.shape}, true_labels: {true_labels_debug.shape}')
     print("Debug data loaded successfully.")
 
@@ -353,42 +469,93 @@ def main():
     conv_model = initializeConvModel(filter_dims=(f_debug, f_debug), num_filters=nf_debug, num_hidden=k_debug, num_labels=k_debug, num_patches=num_patches_debug, seed=randseed)
     print("Convolutional model initialized successfully.")
 
-    #============== Actual forward pass ==============
+    #============== debug forward pass ==============
 
     MX = MX_initialization(X_ims_debug, stride=f_debug)
     Fs_flat = flatten_filters(Fs_debug)
 
-    conv_forward_pass(MX, Fs_flat, conv_model, stride=f_debug)
+    conv_flat_activated, x1, p, z1, z2 = conv_forward_pass(MX,  conv_model, stride=f_debug)
+    print("Convolutional forward pass completed.")
 
-
-
-    # total_x, _, total_y = LoadBatch(1)
+    debug_labels_flat = np.argmax(true_labels_debug, axis=0)
     
-    # for batch_num in range(2, 6):
-    #     data, _, labels = LoadBatch(batch_num)
-    #     total_x = np.vstack([total_x, data])
-    #     total_y = np.concatenate([total_y, labels])
+    grads = BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, debug_labels_flat, l=0.01)
+    print("Convolutional backward pass completed.")
+
+    torch_grads = ComputePytorchGradientsConv(MX, debug_labels_flat, conv_model, lam=0.01)
+    print("PyTorch gradient computation completed.")
+
+    print("\n--- Gradient Check (Relative Error) ---")
+    for layer_name in grads.keys():
+        for param_name in grads[layer_name].keys():
+            ag = grads[layer_name][param_name]
+            pg = torch_grads[layer_name][param_name]
+            
+            # Use your relativeError function
+            error = relativeError(ag, pg)
+            max_error = np.max(error)
+            
+            print(f"{layer_name} - {param_name}: Max Relative Error = {max_error:.2e}")
+            
+            if max_error > 1e-5:
+                print(f"  --> WARNING: High error detected in {layer_name} {param_name}!")
+
+    
+    # ============= end of debug ==============
+    total_x, _, total_y = LoadBatch(1)
+    
+    for batch_num in range(2, 6):
+        data, _, labels = LoadBatch(batch_num)
+        total_x = np.vstack([total_x, data])
+        total_y = np.concatenate([total_y, labels])
         
         
         
-    # train_X = total_x[:49000, :]
-    # train_y = total_y[:49000]
-    # val_X = total_x[49000:, :]
-    # val_y = total_y[49000:]
+    train_X = total_x[:49000, :]
+    train_y = total_y[:49000]
+    val_X = total_x[49000:, :]
+    val_y = total_y[49000:]
 
 
-    # # train_X = total_x[:45000, :]
-    # # train_y = total_y[:45000]
-    # # val_X = total_x[45000:, :]
-    # # val_y = total_y[45000:]
-    # mean_X, std_X = computeMeanStd(train_X)
-    # train_X = normalizeData(train_X, mean_X, std_X) 
-    # print("Training data loaded and normalized.")
+    # train_X = total_x[:45000, :]
+    # train_y = total_y[:45000]
+    # val_X = total_x[45000:, :]
+    # val_y = total_y[45000:]
+    mean_X, std_X = computeMeanStd(train_X)
+    train_X = normalizeData(train_X, mean_X, std_X) 
 
-    # # val_X, _, val_y = LoadBatch(2) 
-    # val_X = normalizeData(val_X, mean_X, std_X) 
-    # print("Validation data loaded and normalized.")
+    val_X = normalizeData(val_X, mean_X, std_X) 
 
+
+    n_train = train_X.shape[0]
+    n_val = val_X.shape[0]
+
+    # Cast to float32
+    train_X_ims = np.transpose(train_X.T.reshape((32, 32, 3, n_train), order='F'), (1, 0, 2, 3)).astype(np.float32)
+    val_X_ims = np.transpose(val_X.T.reshape((32, 32, 3, n_val), order='F'), (1, 0, 2, 3)).astype(np.float32)
+
+    # create MX matrices
+    f_val = 4
+    MX_train = MX_initialization(train_X_ims, stride=f_val)
+    MX_val = MX_initialization(val_X_ims, stride=f_val)
+
+    # initialize network parameters
+    num_filters = 10
+    num_hidden = 50
+    num_patches = int(32//f_val)**2
+
+    conv_model = initializeConvModel(filter_dims=(f_val, f_val), num_filters=num_filters, num_hidden=num_hidden, num_labels=10, num_patches=num_patches, seed=randseed)
+
+    # train network
+    n_batch = 100
+    n_s = 800
+    n_epochs = int((3 * 2 * n_s) / (n_train // n_batch))
+    
+    trained_model, _, val_costs, _, val_losses, _, val_accs, update_steps = miniBatchGradientDescentConv(
+        MX_train, train_y, MX_val, val_y, 
+        n_batch=n_batch, n_epochs=n_epochs, 
+        conv_model=conv_model, lam=0.003, n_s=n_s, seed=randseed
+    )
     # test_X, _, test_y = LoadBatch(-1)
     # test_X = normalizeData(test_X, mean_X, std_X)
     # print("Test data loaded and normalized.")
@@ -428,22 +595,7 @@ def main():
     # trained_model, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescent(
     #         train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=n_epochs, model=model, n_s=n_s, lam=2.64e-04, seed=randseed)
     
-    # print("\n--- Final Model Evaluation ---")
-    
-    # # 1. Run the test images through your fully trained network
-    # z_test, a_test = applyNetwork(test_X, trained_model)
-    
-    # # 2. Get the model's predictions
-    # test_predictions = getPredictedLabels(a_test)
-    
-    # # 3. Calculate the final accuracy against the true test labels
-    # test_accuracy = computeAccuracy(test_predictions, test_y)
-    
-    # # 4. (Optional but good for the report) Calculate the final test cost
-    # test_cost = computeLoss(a_test, trained_model, test_y, l=2.64e-04)
-    
-    # print(f"Final Test Accuracy: {test_accuracy * 100:.2f}%")
-    # print(f"Final Test Cost: {test_cost:.4f}")
+
 
     # fig, axs = plt.subplots(1, 3, figsize=(18, 5)) # Create 1 row with 3 columns
 
@@ -474,6 +626,64 @@ def main():
     # plt.tight_layout() # fix layout
     # plt.show()
 
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# -------------------------------------------------- TORCH-IMPLEMENTATION, USED FOR GRADIENT CHECKING ONLY, FROM DIFFERENT FILE ---------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# def ComputePytorchGradientsConv(MX, labels_flat, conv_model, lam):
+#    
+#     # 1. Convert input data to PyTorch tensors
+#     MX_t = torch.tensor(MX, dtype=torch.float64)
+#     targets = torch.tensor(labels_flat, dtype=torch.long)
+    
+#     # 2. Convert network parameters to PyTorch tensors and require gradients
+#     W_conv = torch.tensor(conv_model["conv_layer"]["weights"], dtype=torch.float64, requires_grad=True)
+#     b_conv = torch.tensor(conv_model["conv_layer"]["bias"], dtype=torch.float64, requires_grad=True)
+    
+#     W1 = torch.tensor(conv_model["hidden_layer"]["weights"], dtype=torch.float64, requires_grad=True)
+#     b1 = torch.tensor(conv_model["hidden_layer"]["bias"], dtype=torch.float64, requires_grad=True)
+    
+#     W2 = torch.tensor(conv_model["output_layer"]["weights"], dtype=torch.float64, requires_grad=True)
+#     b2 = torch.tensor(conv_model["output_layer"]["bias"], dtype=torch.float64, requires_grad=True)
+    
+#     n_p = MX.shape[0]
+#     n = MX.shape[2]
+#     nf = W_conv.shape[1]
+
+#     # FORWARD PASS
+
+#     # Convolutional Layer (Using for-loop)
+#     conv_out = torch.zeros((n_p, nf, n), dtype=torch.float64)
+#     for i in range(n):
+#         conv_out[:, :, i] = torch.matmul(MX_t[:, :, i], W_conv) + b_conv.T
+        
+#     # Flatten and apply ReLU
+#     conv_flat = conv_out.reshape(n_p * nf, n)
+#     x1 = torch.clamp(conv_flat, min=0.0)
+    
+#     # Hidden Layer + ReLU
+#     z1 = torch.matmul(W1, x1) + b1
+#     x2 = torch.clamp(z1, min=0.0)
+    
+#     # Output Layer (Logits only, PyTorch handles the Softmax internally)
+#     z2 = torch.matmul(W2, x2) + b2
+    
+#     # LOSS & BACKPROPAGATION
+#     # nn.CrossEntropyLoss expects logits of shape (batch_size, num_classes), so we transpose z2
+#     criterion = torch.nn.CrossEntropyLoss()
+#     loss_ce = criterion(z2.T, targets)
+    
+#     # L2 Regularization
+#     l2_reg = lam * (torch.sum(W_conv**2) + torch.sum(W1**2) + torch.sum(W2**2))
+#     total_loss = loss_ce + l2_reg
+#     total_loss.backward()
+    
+#     # Return the gradients
+#     return {
+#         "conv_layer": {"weights": W_conv.grad.numpy(), "bias": b_conv.grad.numpy()},
+#         "hidden_layer": {"weights": W1.grad.numpy(), "bias": b1.grad.numpy()},
+#         "output_layer": {"weights": W2.grad.numpy(), "bias": b2.grad.numpy()}
+#     }
 
 if __name__ == "__main__":
     main()
