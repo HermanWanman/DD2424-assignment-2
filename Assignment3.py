@@ -184,6 +184,9 @@ def computeLoss(a_values, model, labels, l, onehot: bool = False):
     total_loss = (1/N) * sum1 + l * sum2  
     return total_loss 
 
+def ReLU(x):
+    return np.maximum(0,x)
+
 def getPredictedLabels(a_values):
     predicted_labels = np.argmax(a_values[-1], axis=0) 
     return predicted_labels
@@ -282,8 +285,17 @@ def miniBatchGradientDescent(
     return model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps 
 
 def conv_forward_pass(MX, flattened_Fs, conv_model, stride=4):
+    n_p = MX.shape[0]
+    n = MX.shape[2]
+    nf = flattened_Fs.shape[1]
     conv_out = convolutional_layer_calculation(MX, flattened_Fs, stride=stride)
+    conv_flat_activated = np.fmax(conv_out.reshape((n_p*nf, n), order='C'), 0)
+
+    z1, x1 = applyLayer(conv_flat_activated, conv_model["hidden_layer"], apply_relu=True)
     
+    z2, p = applyLayer(x1, conv_model["output_layer"], apply_relu=False)
+    
+    return conv_flat_activated, x1, p, z1, z2
 
 
 def computeCyclicalLearningRate(eta_min, eta_max, n_s, t):
@@ -343,7 +355,10 @@ def main():
 
     #============== Actual forward pass ==============
 
-    conv_forward_pass(MX_initialization(X_ims_debug, stride=f_debug), flatten_filters(Fs_debug), conv_model, stride=f_debug)
+    MX = MX_initialization(X_ims_debug, stride=f_debug)
+    Fs_flat = flatten_filters(Fs_debug)
+
+    conv_forward_pass(MX, Fs_flat, conv_model, stride=f_debug)
 
 
 
