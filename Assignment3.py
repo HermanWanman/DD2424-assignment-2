@@ -322,17 +322,19 @@ def miniBatchGradientDescentConv(
         current_step = (epoch + 1) * (n // n_batch)
         update_steps.append(current_step)
 
-        # Evaluate Validation Data at the end of each epoch
+        # Evaluate Training and Validation Data at the end of each epoch
         _, _, p_val, _, _ = conv_forward_pass(MX_val, model_trained) 
-        
-        # adapt computeLoss logic here for the CNN
         val_loss = np.mean(-np.log(np.clip(p_val[labels_val_flat, np.arange(len(labels_val_flat))], 1e-15, 1.0 - 1e-15)))
         val_losses.append(val_loss)
-        
         l2_reg = lam * (np.sum(model_trained["conv_layer"]["weights"]**2) + np.sum(model_trained["hidden_layer"]["weights"]**2) + np.sum(model_trained["output_layer"]["weights"]**2))
         val_costs.append(val_loss + l2_reg) 
-        
         val_accs.append(computeAccuracy(np.argmax(p_val, axis=0), labels_val_flat))
+
+        _, _, p_train, _, _ = conv_forward_pass(MX_train, model_trained)
+        train_loss = np.mean(-np.log(np.clip(p_train[labels_train_flat, np.arange(len(labels_train_flat))], 1e-15, 1.0 - 1e-15)))
+        train_losses.append(train_loss)
+        train_costs.append(train_loss + l2_reg) # Uses the same L2 penalty calculated above
+        train_accs.append(computeAccuracy(np.argmax(p_train, axis=0), labels_train_flat))
         
         print(f"Epoch {epoch+1}/{n_epochs} | Val Acc: {val_accs[-1]*100:.2f}% | Val Cost: {val_costs[-1]:.4f}")
 
@@ -439,126 +441,280 @@ def lambda_search(n_s, dims,train_X, train_y, val_X, val_y,search_range=(-5,-1),
     search_results.sort(key=lambda x: x[1], reverse=True)
     return search_results
 
- 
+def plot_training_curves(update_steps, train_losses, val_losses, train_accs, val_accs):
+    """
+    Visualizes the training and validation metrics over the update steps.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Plot Loss Curves ---
+    ax1.plot(update_steps, train_losses, label='Training Loss', color='teal', linewidth=1.5)
+    ax1.plot(update_steps, val_losses, label='Validation Loss', color='coral', linewidth=1.5)
+    ax1.set_xlabel('Update Step', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Loss Curves', fontsize=14)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    # --- Plot Accuracy Curves ---
+    train_accs_pct = [acc * 100 for acc in train_accs]
+    val_accs_pct = [acc * 100 for acc in val_accs]
+    
+    ax2.plot(update_steps, train_accs_pct, label='Training Accuracy', color='teal', linewidth=1.5)
+    ax2.plot(update_steps, val_accs_pct, label='Validation Accuracy', color='coral', linewidth=1.5)
+    ax2.set_xlabel('Update Step', fontsize=12)
+    ax2.set_ylabel('Accuracy (%)', fontsize=12)
+    ax2.set_title('Accuracy Curves', fontsize=14)
+    ax2.legend(loc='lower right')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.show()
+
+def evaluate_model_accuracy(MX, labels_flat, trained_model):
+    _, _, p, _, _ = conv_forward_pass(MX, trained_model)
+    predicted_labels = np.argmax(p, axis=0)
+    accuracy = np.mean(predicted_labels == labels_flat)
+    
+    return accuracy
 
 def main():
-    randseed = 42 # np.random.randint(0, 1000) 
-    nf_debug = 2
-    k_debug = 10
-    f_debug = 4
-    num_patches_debug = int(32//f_debug)**2
-
-
-
-    X_ims_debug, Fs_debug, true_convolutions_debug, true_labels_debug = debug_data_load()
-    # print(f'Debug data shapes - X_ims: {X_ims_debug.shape}, Fs: {Fs_debug.shape}, true_labels: {true_labels_debug.shape}')
-    print("Debug data loaded successfully.")
-
-    computed_conv_outputs_debug = seq_convolutional_layer_calculation(X_ims_debug, Fs_debug, num_filters=nf_debug, stride=f_debug)
-    print("Debug convolutional layer calculation completed.")
-    # print(f'Computed convolutional outputs shape: {computed_conv_outputs_debug.shape}')
-    # diff = np.abs(computed_conv_outputs_debug - true_labels_debug)
-
-    conv_outputs_flat = computed_conv_outputs_debug.reshape((num_patches_debug, nf_debug, true_convolutions_debug.shape[3]), order='C')
     
-    matrix_conv_outputs = convolutional_layer_calculation(MX=MX_initialization(X_ims_debug, stride=f_debug), flattened_Fs=flatten_filters(Fs_debug), stride=f_debug)
-    print("Matrix convolutional layer calculation completed.")
-    # print(f'Matrix convolutional outputs shape: {matrix_conv_outputs.shape}')
-    # print(f'Max absolute difference between sequential and matrix convolutional outputs: {np.max(np.abs(conv_outputs_flat - matrix_conv_outputs))}')
-
-    conv_model = initializeConvModel(filter_dims=(f_debug, f_debug), num_filters=nf_debug, num_hidden=k_debug, num_labels=k_debug, num_patches=num_patches_debug, seed=randseed)
-    print("Convolutional model initialized successfully.")
-
-    #============== debug forward pass ==============
-
-    MX = MX_initialization(X_ims_debug, stride=f_debug)
-    Fs_flat = flatten_filters(Fs_debug)
-
-    conv_flat_activated, x1, p, z1, z2 = conv_forward_pass(MX,  conv_model, stride=f_debug)
-    print("Convolutional forward pass completed.")
-
-    debug_labels_flat = np.argmax(true_labels_debug, axis=0)
     
-    grads = BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, debug_labels_flat, l=0.01)
-    print("Convolutional backward pass completed.")
+    # nf_debug = 2
+    # k_debug = 10
+    # f_debug = 4
+    # num_patches_debug = int(32//f_debug)**2
 
-    torch_grads = ComputePytorchGradientsConv(MX, debug_labels_flat, conv_model, lam=0.01)
-    print("PyTorch gradient computation completed.")
+    # X_ims_debug, Fs_debug, true_convolutions_debug, true_labels_debug = debug_data_load()
+    # print("Debug data loaded successfully.")
 
-    print("\n--- Gradient Check (Relative Error) ---")
-    for layer_name in grads.keys():
-        for param_name in grads[layer_name].keys():
-            ag = grads[layer_name][param_name]
-            pg = torch_grads[layer_name][param_name]
-            
-            # Use your relativeError function
-            error = relativeError(ag, pg)
-            max_error = np.max(error)
-            
-            print(f"{layer_name} - {param_name}: Max Relative Error = {max_error:.2e}")
-            
-            if max_error > 1e-5:
-                print(f"  --> WARNING: High error detected in {layer_name} {param_name}!")
+    # computed_conv_outputs_debug = seq_convolutional_layer_calculation(X_ims_debug, Fs_debug, num_filters=nf_debug, stride=f_debug)
+    # print("Debug convolutional layer calculation completed.")
 
+    # conv_outputs_flat = computed_conv_outputs_debug.reshape((num_patches_debug, nf_debug, true_convolutions_debug.shape[3]), order='C')
     
-    # ============= end of debug ==============
+    # matrix_conv_outputs = convolutional_layer_calculation(MX=MX_initialization(X_ims_debug, stride=f_debug), flattened_Fs=flatten_filters(Fs_debug), stride=f_debug)
+    # print("Matrix convolutional layer calculation completed.")
+
+    # conv_model = initializeConvModel(filter_dims=(f_debug, f_debug), num_filters=nf_debug, num_hidden=k_debug, num_labels=k_debug, num_patches=num_patches_debug, seed=randseed)
+    # print("Convolutional model initialized successfully.")
+
+    # ============== debug forward pass ==============
+    # MX = MX_initialization(X_ims_debug, stride=f_debug)
+    # Fs_flat = flatten_filters(Fs_debug)
+    # conv_flat_activated, x1, p, z1, z2 = conv_forward_pass(MX,  conv_model, stride=f_debug)
+    # print("Convolutional forward pass completed.")
+    # debug_labels_flat = np.argmax(true_labels_debug, axis=0)
+    # grads = BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, debug_labels_flat, l=0.01)
+    # print("Convolutional backward pass completed.")
+    # torch_grads = ComputePytorchGradientsConv(MX, debug_labels_flat, conv_model, lam=0.01)
+    # print("PyTorch gradient computation completed.")
+    # print("\n--- Gradient Check (Relative Error) ---")
+    # for layer_name in grads.keys():
+    #     for param_name in grads[layer_name].keys():
+    #         ag = grads[layer_name][param_name]
+    #         pg = torch_grads[layer_name][param_name]
+    #         error = relativeError(ag, pg)
+    #         max_error = np.max(error)
+    #         print(f"{layer_name} - {param_name}: Max Relative Error = {max_error:.2e}")
+    #         if max_error > 1e-5:
+    #             print(f"  --> WARNING: High error detected in {layer_name} {param_name}!")
+
+
+    randseed = 42
+    # EXPERIMENT CONTROL 
+    
+    # Architecture
+    f_val = 4          # Filter size (f)
+    num_filters = 10   # Number of convolutional filters (nf)
+    num_hidden = 50    # Number of hidden nodes (nh)
+    num_labels = 10
+    
+    # Training Hyperparameters
+    n_batch = 100
+    n_cycles = 3       # Number of cycles to run
+    n_s = 800          # Step size
+    lam = 0.003        # L2 Regularization lambda
+    
+    
+    # DATA PREPARATION
     total_x, _, total_y = LoadBatch(1)
-    
     for batch_num in range(2, 6):
         data, _, labels = LoadBatch(batch_num)
         total_x = np.vstack([total_x, data])
         total_y = np.concatenate([total_y, labels])
         
-        
-        
+    # Split into Train and Validation
     train_X = total_x[:49000, :]
     train_y = total_y[:49000]
     val_X = total_x[49000:, :]
     val_y = total_y[49000:]
 
-
-    # train_X = total_x[:45000, :]
-    # train_y = total_y[:45000]
-    # val_X = total_x[45000:, :]
-    # val_y = total_y[45000:]
+    # Normalize Data
     mean_X, std_X = computeMeanStd(train_X)
     train_X = normalizeData(train_X, mean_X, std_X) 
-
     val_X = normalizeData(val_X, mean_X, std_X) 
+
+    # Load and Normalize Test Data
+    test_X, _, test_y = LoadBatch(-1)
+    test_X = normalizeData(test_X, mean_X, std_X)
+    n_test = test_X.shape[0]
+    test_X_ims = np.transpose(test_X.T.reshape((32, 32, 3, n_test), order='F'), (1, 0, 2, 3)).astype(np.float32)
+    MX_test = MX_initialization(test_X_ims, stride=f_val).astype(np.float32)
 
 
     n_train = train_X.shape[0]
     n_val = val_X.shape[0]
 
-    # Cast to float32
     train_X_ims = np.transpose(train_X.T.reshape((32, 32, 3, n_train), order='F'), (1, 0, 2, 3)).astype(np.float32)
     val_X_ims = np.transpose(val_X.T.reshape((32, 32, 3, n_val), order='F'), (1, 0, 2, 3)).astype(np.float32)
+    print("Data preparation complete.")
 
-    # create MX matrices
-    f_val = 4
-    MX_train = MX_initialization(train_X_ims, stride=f_val)
-    MX_val = MX_initialization(val_X_ims, stride=f_val)
-
-    # initialize network parameters
-    num_filters = 10
-    num_hidden = 50
-    num_patches = int(32//f_val)**2
-
-    conv_model = initializeConvModel(filter_dims=(f_val, f_val), num_filters=num_filters, num_hidden=num_hidden, num_labels=10, num_patches=num_patches, seed=randseed)
-
-    # train network
-    n_batch = 100
-    n_s = 800
-    n_epochs = int((3 * 2 * n_s) / (n_train // n_batch))
+  
+    # # Calculate derived parameters
+    # num_patches = int(32 // f_val)**2
+    # steps_per_epoch = n_train // n_batch
+    # total_update_steps = n_cycles * 2 * n_s
+    # n_epochs = int(total_update_steps / steps_per_epoch)
     
-    trained_model, _, val_costs, _, val_losses, _, val_accs, update_steps = miniBatchGradientDescentConv(
-        MX_train, train_y, MX_val, val_y, 
-        n_batch=n_batch, n_epochs=n_epochs, 
-        conv_model=conv_model, lam=0.003, n_s=n_s, seed=randseed
-    )
-    # test_X, _, test_y = LoadBatch(-1)
-    # test_X = normalizeData(test_X, mean_X, std_X)
-    # print("Test data loaded and normalized.")
+    # print(f"Architecture: f={f_val}, nf={num_filters}, nh={num_hidden}")
+    # print(f"Training parameters: lam={lam}, batch={n_batch}, n_s={n_s}")
+    # print(f"Executing {n_cycles} cycles -> {n_epochs} epochs total.")
+
+    # # EXECUTION (Patch extraction, model init, training, plotting)
+    # print(f"Constructing MX matrices for stride f={f_val}...")
+    # MX_train = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
+    # MX_val = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
+
+    # conv_model = initializeConvModel(
+    #     filter_dims=(f_val, f_val), 
+    #     num_filters=num_filters, 
+    #     num_hidden=num_hidden, 
+    #     num_labels=num_labels, 
+    #     num_patches=num_patches, 
+    #     seed=randseed
+    # )
+
+    # model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescentConv(
+    #     MX_train, train_y, MX_val, val_y, 
+    #     n_batch=n_batch, 
+    #     n_epochs=n_epochs, 
+    #     conv_model=conv_model, 
+    #     lam=lam, 
+    #     n_s=n_s, 
+    #     seed=randseed
+    # )
+    # print(f'Final Test Accuracy: {evaluate_model_accuracy(MX_test, test_y, model_trained) * 100:.2f}%')
+    # plot_training_curves(update_steps, train_losses, val_losses, train_accs, val_accs)
+    architectures = [
+        (2, 3, 50),
+        (4, 10, 50),
+        (8, 40, 50),
+        (16, 160, 50)
+    ]
+
+    # Constant Hyperparameters
+    n_batch = 100
+    n_cycles = 3       
+    n_s = 800          
+    lam = 0.003
+    randseed = 42
+
+    # Storage arrays for our bar charts
+    test_accuracies = []
+    training_times = []
+    plot_labels = []
+
+    for f_val, num_filters, num_hidden in architectures:
+        print(f"\n{'='*55}")
+        print(f"Evaluating Architecture: f={f_val}, nf={num_filters}, nh={num_hidden}")
+        print(f"{'='*55}")
+
+        # Recalculate patches based on the CURRENT f_val
+        num_patches = int(32 // f_val)**2
+        
+        # Rebuild MX matrices! (f_val determines their shape)
+        print(f"Constructing MX matrices for stride f={f_val}...")
+        MX_train = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
+        MX_val = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
+        MX_test = MX_initialization(test_X_ims, stride=f_val).astype(np.float32)
+
+        # Initialize Model
+        conv_model = initializeConvModel(
+            filter_dims=(f_val, f_val), 
+            num_filters=num_filters, 
+            num_hidden=num_hidden, 
+            num_labels=10, 
+            num_patches=num_patches, 
+            seed=randseed
+        )
+
+        # Calculate epochs and run training
+        steps_per_epoch = n_train // n_batch
+        total_update_steps = n_cycles * 2 * n_s
+        n_epochs = int(total_update_steps / steps_per_epoch)
+
+        start_time = time.time()
+        
+        # We only need the trained model
+        model_trained, _, _, _, _, _, _, _ = miniBatchGradientDescentConv(
+            MX_train, train_y, MX_val, val_y, 
+            n_batch=n_batch, 
+            n_epochs=n_epochs, 
+            conv_model=conv_model, 
+            lam=lam, 
+            n_s=n_s, 
+            seed=randseed
+        )
+        
+        end_time = time.time()
+        run_time = end_time - start_time
+
+        # 5. Evaluate and Record
+        test_acc = evaluate_model_accuracy(MX_test, test_y, model_trained)
+        
+        print(f"--> Final Test Accuracy: {test_acc * 100:.2f}%")
+        print(f"--> Training Time: {run_time:.2f} seconds")
+
+        test_accuracies.append(test_acc * 100)
+        training_times.append(run_time)
+        plot_labels.append(f"f={f_val}\nnf={num_filters}")
+
+
+    # GENERATE BAR CHARTS
+
+    print("\nGenerating performance charts...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    colors = ['#4c72b0', '#55a868', '#c44e52', '#8172b2'] # Nice professional color palette
+
+    # Chart 1: Accuracy
+    bars1 = ax1.bar(plot_labels, test_accuracies, color=colors)
+    ax1.set_title('Final Test Performance by Architecture', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Test Accuracy (%)', fontsize=12)
+    ax1.set_ylim(0, 100) # Lock y-axis to 100% for context
+    ax1.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Add percentage labels on top of bars
+    for bar in bars1:
+        yval = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2, yval + 1.5, f"{yval:.1f}%", ha='center', va='bottom', fontsize=10)
+
+    # Chart 2: Time
+    bars2 = ax2.bar(plot_labels, training_times, color=colors)
+    ax2.set_title('Training Time by Architecture', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Time (seconds)', fontsize=12)
+    ax2.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Add time labels on top of bars
+    for bar in bars2:
+        yval = bar.get_height()
+        max_time = max(training_times)
+        ax2.text(bar.get_x() + bar.get_width()/2, yval + (max_time * 0.02), f"{yval:.1f}s", ha='center', va='bottom', fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+
 
 
     # n_batch = 100
@@ -596,35 +752,6 @@ def main():
     #         train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=n_epochs, model=model, n_s=n_s, lam=2.64e-04, seed=randseed)
     
 
-
-    # fig, axs = plt.subplots(1, 3, figsize=(18, 5)) # Create 1 row with 3 columns
-
-    # # Cost Plot
-    # axs[0].plot(update_steps, train_costs, label='training cost', color='teal')
-    # axs[0].plot(update_steps, val_costs, label='validation cost', color='crimson')
-    # axs[0].set_xlabel('update step')
-    # axs[0].set_ylabel('cost')
-    # axs[0].set_title('Cost plot')
-    # axs[0].legend()
-
-    # # Loss Plot
-    # axs[1].plot(update_steps, train_losses, label='training loss', color='teal')
-    # axs[1].plot(update_steps, val_losses, label='validation loss', color='crimson')
-    # axs[1].set_xlabel('update step')
-    # axs[1].set_ylabel('loss')
-    # axs[1].set_title('Loss plot')
-    # axs[1].legend()
-
-    # # Accuracy Plot
-    # axs[2].plot(update_steps, train_accs, label='training accuracy', color='teal')
-    # axs[2].plot(update_steps, val_accs, label='validation accuracy', color='crimson')
-    # axs[2].set_xlabel('update step')
-    # axs[2].set_ylabel('accuracy')
-    # axs[2].set_title('Accuracy plot')
-    # axs[2].legend()
-
-    # plt.tight_layout() # fix layout
-    # plt.show()
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 # -------------------------------------------------- TORCH-IMPLEMENTATION, USED FOR GRADIENT CHECKING ONLY, FROM DIFFERENT FILE ---------------------------------------------------
