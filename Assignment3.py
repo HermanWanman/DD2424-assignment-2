@@ -234,15 +234,47 @@ def BackwardPass(z_values, a_values, model, labels, l):
         grads[i] = {"weights": dL_dw, "bias": dL_db}
     
     return grads
+def compute_gradient_with_label_smoothing(p, labels_flat, epsilon=0.1):
+    """
+    Computes the gradient of the loss w.r.t the pre-softmax scores using label smoothing.
+    
+    p: Predicted probabilities of shape (K, N)
+    labels_flat: 1D array of ground truth labels of length N
+    epsilon: Label smoothing factor
+    """
+    K = p.shape[0]  # Number of classes (10)
+    N = p.shape[1]  # Batch size
+    
+    # 1. Initialize the Y_smooth matrix with the base penalty for all incorrect classes
+    # Every entry gets epsilon / (K - 1)
+    Y_smooth = np.full((K, N), epsilon / (K - 1))
+    
+    # 2. Overwrite the correct class indices with the true class probability (1 - epsilon)
+    Y_smooth[labels_flat, np.arange(N)] = 1.0 - epsilon
+    
+    # 3. Compute the final gradient: p - y_smooth
+    g = p - Y_smooth
+    
+    return g
 
-def BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, labels, l):
+def BackwardPassConv(MX, conv_flat_activated, x1, p, z1, conv_model, labels, l, epsilon=0.0):
     N = p.shape[1]
+    K = p.shape[0]
     n_p = MX.shape[0]
     nf = conv_model["conv_layer"]["weights"].shape[1] 
 
     # LAYER L-1 (Output layer with softmax)
-    g = p.copy()
-    g[labels.flatten(), np.arange(N)] -= 1
+    if epsilon > 0.0:
+        # Create Y_smooth matrix filled with the penalty for incorrect classes
+        Y_smooth = np.full((K, N), epsilon / (K - 1))
+        # Set the probability for the true classes
+        Y_smooth[labels.flatten(), np.arange(N)] = 1.0 - epsilon
+        # The new gradient is p - y_smooth
+        g = p - Y_smooth
+    else:
+        # Standard one-hot gradient (p - y)
+        g = p.copy()
+        g[labels.flatten(), np.arange(N)] -= 1
     
     dL_dW2 = (1/N) * np.matmul(g, x1.T) + 2 * l * conv_model["output_layer"]["weights"]
     dL_db2 = (1/N) * np.sum(g, axis=1, keepdims=True)
@@ -282,7 +314,7 @@ def relativeError(grad1, grad2, eps=1e-8):
 
 def miniBatchGradientDescentConv(
         MX_train, labels_train_flat, MX_val, labels_val_flat, n_batch, 
-         n_epochs, conv_model, lam, n_s = 500, seed=42): 
+         n_epochs, conv_model, lam, n_s = 500, seed=42, epsilon=0.0): 
     
     n = MX_train.shape[2] 
     model_trained = copy.deepcopy(conv_model) 
@@ -294,6 +326,9 @@ def miniBatchGradientDescentConv(
     
     start_time = time.time()
 
+    current_n_s = n_s # current cycle step size, will double after each cycle
+    t_cycle = 0       # time in cycle
+
     for epoch in range(n_epochs):
         rng = np.random.RandomState(seed + epoch)
         shuffled_indices = rng.permutation(n) 
@@ -302,22 +337,30 @@ def miniBatchGradientDescentConv(
             i_start = i * n_batch 
             i_end = (i+1) * n_batch 
             inds = np.arange(i_start, i_end) 
-            t = epoch * (n // n_batch) + i 
+            
+            # Absolute update step (used only for plotting x-axis)
+            t_absolute = epoch * (n // n_batch) + i 
 
-            learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=n_s, t=t)
+            # Calculate learning rate using the LOCAL clock and CURRENT n_s
+            learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=current_n_s, t_cycle=t_cycle)
 
-            # Slice the MX batch (shape is n_p, 3*f*f, n) => slice on the 3rd axis
+            # Slice the MX batch
             mx_batch = MX_train[:, :, shuffled_indices[inds]] 
             y_batch = labels_train_flat[shuffled_indices[inds]] 
             
             # Forward and Backward pass
             conv_flat_activated, x1, p, z1, z2 = conv_forward_pass(mx_batch, model_trained)
-            grads = BackwardPassConv(mx_batch, conv_flat_activated, x1, p, z1, model_trained, y_batch, l=lam) 
+            grads = BackwardPassConv(mx_batch, conv_flat_activated, x1, p, z1, model_trained, y_batch, l=lam, epsilon=epsilon)
             
             # Update parameters
             for layer_name in model_trained.keys():
                 model_trained[layer_name]["weights"] -= learningRate * grads[layer_name]["weights"]
                 model_trained[layer_name]["bias"] -= learningRate * grads[layer_name]["bias"]
+
+            t_cycle += 1
+            if t_cycle == 2 * current_n_s:
+                t_cycle = 0
+                current_n_s *= 2
 
         current_step = (epoch + 1) * (n // n_batch)
         update_steps.append(current_step)
@@ -345,7 +388,7 @@ def miniBatchGradientDescentConv(
 
 def miniBatchGradientDescent(
         X_train, labels_train, X_val, labels_val, n_batch, 
-         n_epochs, model, lam, n_s = 500, learningRateCalc="static", seed=42): 
+         n_epochs, model, lam, n_s = 500, learningRateCalc="static", seed=42, epsilon=0.0): 
     
     n = X_train.shape[0] 
     model_trained = copy.deepcopy(model) 
@@ -367,7 +410,7 @@ def miniBatchGradientDescent(
             t = epoch * n//n_batch + i # update step, saved for plotting
 
             if learningRateCalc == "cyclical":
-                learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=n_s, t=t)
+                learningRate = computeCyclicalLearningRate(eta_min=1e-5, eta_max=1e-1, n_s=n_s, t_cycle=t)
             else:
                 learningRate = 1e-3  # static learning rate
 
@@ -416,12 +459,18 @@ def conv_forward_pass(MX, conv_model, stride=4):
     return conv_flat_activated, x1, p, z1, z2
 
 
-def computeCyclicalLearningRate(eta_min, eta_max, n_s, t):
-    l = t // (2 * n_s)
-    if 2*l*n_s <= t <= (2*l+1)*n_s:
-        learningRate = eta_min + ((t - 2*l*n_s) / n_s) * (eta_max - eta_min)
+def computeCyclicalLearningRate(eta_min, eta_max, n_s, t_cycle):
+    """
+    Computes the cyclic learning rate based on a local cycle clock.
+    t_cycle is guaranteed to be between 0 and 2*n_s.
+    """
+    if t_cycle <= n_s:
+        # We are in the upward slope of the triangle
+        learningRate = eta_min + (t_cycle / n_s) * (eta_max - eta_min)
     else:        
-        learningRate = eta_max - ((t - (2*l+1)*n_s) / n_s) * (eta_max - eta_min)
+        # We are in the downward slope of the triangle
+        learningRate = eta_max - ((t_cycle - n_s) / n_s) * (eta_max - eta_min)
+        
     return learningRate
 
 def lambda_search(n_s, dims,train_X, train_y, val_X, val_y,search_range=(-5,-1),seed=42, search_amount=10, n_epochs=8):
@@ -432,7 +481,7 @@ def lambda_search(n_s, dims,train_X, train_y, val_X, val_y,search_range=(-5,-1),
 
         model = initializeModel(dims, seed=seed+i)
         trained_model, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescent(
-            train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=n_epochs, model=model, n_s=n_s, lam=lam, seed=seed+i)
+            train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=n_epochs, model=model, n_s=n_s, lam=lam, seed=seed+i, epsilon=0.1)
         # print("Mini-batch gradient descent completed.")
         best_val_acc = max(val_accs)
         search_results.append((lam, best_val_acc))
@@ -534,7 +583,7 @@ def main():
     # Training Hyperparameters
     n_batch = 100
     n_cycles = 3       # Number of cycles to run
-    n_s = 800          # Step size
+    n_s_initial = 800  # Step size for the first cycle (will double after each cycle)
     lam = 0.003        # L2 Regularization lambda
     
     
@@ -571,42 +620,6 @@ def main():
     val_X_ims = np.transpose(val_X.T.reshape((32, 32, 3, n_val), order='F'), (1, 0, 2, 3)).astype(np.float32)
     print("Data preparation complete.")
 
-  
-    # # Calculate derived parameters
-    # num_patches = int(32 // f_val)**2
-    # steps_per_epoch = n_train // n_batch
-    # total_update_steps = n_cycles * 2 * n_s
-    # n_epochs = int(total_update_steps / steps_per_epoch)
-    
-    # print(f"Architecture: f={f_val}, nf={num_filters}, nh={num_hidden}")
-    # print(f"Training parameters: lam={lam}, batch={n_batch}, n_s={n_s}")
-    # print(f"Executing {n_cycles} cycles -> {n_epochs} epochs total.")
-
-    # # EXECUTION (Patch extraction, model init, training, plotting)
-    # print(f"Constructing MX matrices for stride f={f_val}...")
-    # MX_train = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
-    # MX_val = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
-
-    # conv_model = initializeConvModel(
-    #     filter_dims=(f_val, f_val), 
-    #     num_filters=num_filters, 
-    #     num_hidden=num_hidden, 
-    #     num_labels=num_labels, 
-    #     num_patches=num_patches, 
-    #     seed=randseed
-    # )
-
-    # model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescentConv(
-    #     MX_train, train_y, MX_val, val_y, 
-    #     n_batch=n_batch, 
-    #     n_epochs=n_epochs, 
-    #     conv_model=conv_model, 
-    #     lam=lam, 
-    #     n_s=n_s, 
-    #     seed=randseed
-    # )
-    # print(f'Final Test Accuracy: {evaluate_model_accuracy(MX_test, test_y, model_trained) * 100:.2f}%')
-    # plot_training_curves(update_steps, train_losses, val_losses, train_accs, val_accs)
     architectures = [
         (2, 3, 50),
         (4, 10, 50),
@@ -616,32 +629,145 @@ def main():
 
     # Constant Hyperparameters
     n_batch = 100
-    n_cycles = 3       
-    n_s = 800          
+    n_cycles = 4       
+    n_s_initial = 800
+    # Total steps for 4 doubling cycles: (2 * n_s) + (4 * n_s) + (8 * n_s) + (16 * n_s) = 30 * n_s
+    total_update_steps = 30 * n_s_initial       
     lam = 0.003
     randseed = 42
 
-    # Storage arrays for our bar charts
+    # Storage arrays for bar charts
     test_accuracies = []
     training_times = []
     plot_labels = []
 
-    for f_val, num_filters, num_hidden in architectures:
-        print(f"\n{'='*55}")
-        print(f"Evaluating Architecture: f={f_val}, nf={num_filters}, nh={num_hidden}")
-        print(f"{'='*55}")
+    # for f_val, num_filters, num_hidden in architectures:
+    #     print(f"\n{'='*55}")
+    #     print(f"Evaluating Architecture: f={f_val}, nf={num_filters}, nh={num_hidden}")
+    #     print(f"{'='*55}")
 
-        # Recalculate patches based on the CURRENT f_val
+    #     # Recalculate patches based on the CURRENT f_val
+    #     num_patches = int(32 // f_val)**2
+        
+    #     # Rebuild MX matrices! (f_val determines their shape)
+    #     print(f"Constructing MX matrices for stride f={f_val}...")
+    #     MX_train = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
+    #     MX_val = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
+    #     MX_test = MX_initialization(test_X_ims, stride=f_val).astype(np.float32)
+
+    #     # Initialize Model
+    #     conv_model = initializeConvModel(
+    #         filter_dims=(f_val, f_val), 
+    #         num_filters=num_filters, 
+    #         num_hidden=num_hidden, 
+    #         num_labels=10, 
+    #         num_patches=num_patches, 
+    #         seed=randseed
+    #     )
+
+    #     # Calculate epochs and run training
+    #     total_update_steps = n_cycles * 2 * n_s_initial
+    #     steps_per_epoch = n_train // n_batch
+    #     n_epochs = int(total_update_steps / steps_per_epoch)
+
+    #     start_time = time.time()
+        
+    #     # We only need the trained model
+    #     model_trained, _, _, _, _, _, _, _ = miniBatchGradientDescentConv(
+    #         MX_train, train_y, MX_val, val_y, 
+    #         n_batch=n_batch, 
+    #         n_epochs=n_epochs, 
+    #         conv_model=conv_model, 
+    #         lam=lam, 
+    #         n_s=n_s_initial, 
+    #         seed=randseed
+    #     )
+        
+    #     end_time = time.time()
+    #     run_time = end_time - start_time
+
+    #     # Evaluate and Record
+    #     test_acc = evaluate_model_accuracy(MX_test, test_y, model_trained)
+        
+    #     print(f"--> Final Test Accuracy: {test_acc * 100:.2f}%")
+    #     print(f"--> Training Time: {run_time:.2f} seconds")
+
+    #     test_accuracies.append(test_acc * 100)
+    #     training_times.append(run_time)
+    #     plot_labels.append(f"f={f_val}\nnf={num_filters}")
+
+
+    # # GENERATE BAR CHARTS
+
+    # print("\nGenerating performance charts...")
+    # fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # colors = ['#4c72b0', '#55a868', '#c44e52', '#8172b2'] # Nice professional color palette
+
+    # # Chart 1: Accuracy
+    # bars1 = ax1.bar(plot_labels, test_accuracies, color=colors)
+    # ax1.set_title('Final Test Performance by Architecture', fontsize=14, fontweight='bold')
+    # ax1.set_ylabel('Test Accuracy (%)', fontsize=12)
+    # ax1.set_ylim(0, 100) # Lock y-axis to 100% for context
+    # ax1.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # # Add percentage labels on top of bars
+    # for bar in bars1:
+    #     yval = bar.get_height()
+    #     ax1.text(bar.get_x() + bar.get_width()/2, yval + 1.5, f"{yval:.1f}%", ha='center', va='bottom', fontsize=10)
+
+    # # Chart 2: Time
+    # bars2 = ax2.bar(plot_labels, training_times, color=colors)
+    # ax2.set_title('Training Time by Architecture', fontsize=14, fontweight='bold')
+    # ax2.set_ylabel('Time (seconds)', fontsize=12)
+    # ax2.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # # Add time labels on top of bars
+    # for bar in bars2:
+    #     yval = bar.get_height()
+    #     max_time = max(training_times)
+    #     ax2.text(bar.get_x() + bar.get_width()/2, yval + (max_time * 0.02), f"{yval:.1f}s", ha='center', va='bottom', fontsize=10)
+
+    # plt.tight_layout()
+    # plt.show()
+
+
+
+    print("\n" + "="*60)
+    print("EXERCISE 3: TRAIN FOR LONGER & WIDTH INVESTIGATION")
+    print("="*60)
+
+    # Define the three specific architectures to investigate
+    # 1. Architecture 2 (Train for longer)
+    # 2. Architecture 3 (Train for longer)
+    # 3. Architecture 2 with increased width
+    extended_architectures = [
+        # {"f": 4, "nf": 10, "nh": 50, "name": "Arch 2 (Longer)"},
+        # {"f": 8, "nf": 40, "nh": 50, "name": "Arch 3 (Longer)"},
+        # {"f": 4, "nf": 40, "nh": 50, "name": "Arch 2 (Wider: nf=40)"}
+        {"f": 4, "nf": 40, "nh": 300, "name": "Exercise 4 (Wider: nf=40, nh=300)"},
+    ]
+
+    n_cycles = 4       
+    n_s_initial = 800  
+    lam = 0.0025
+    n_batch = 100
+
+    for config in extended_architectures:
+        f_val = config["f"]
+        num_filters = config["nf"]
+        num_hidden = config["nh"]
+        model_name = config["name"]
+
+        print(f"\nTraining {model_name} -> f={f_val}, nf={num_filters}, nh={num_hidden}")
+        
         num_patches = int(32 // f_val)**2
         
-        # Rebuild MX matrices! (f_val determines their shape)
-        print(f"Constructing MX matrices for stride f={f_val}...")
-        MX_train = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
-        MX_val = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
-        MX_test = MX_initialization(test_X_ims, stride=f_val).astype(np.float32)
+        # Rebuild MX matrices for the current stride
+        MX_train_ext = MX_initialization(train_X_ims, stride=f_val).astype(np.float32)
+        MX_val_ext = MX_initialization(val_X_ims, stride=f_val).astype(np.float32)
+        MX_test_ext = MX_initialization(test_X_ims, stride=f_val).astype(np.float32)
 
-        # Initialize Model
-        conv_model = initializeConvModel(
+        conv_model_ext = initializeConvModel(
             filter_dims=(f_val, f_val), 
             num_filters=num_filters, 
             num_hidden=num_hidden, 
@@ -650,107 +776,28 @@ def main():
             seed=randseed
         )
 
-        # Calculate epochs and run training
+        total_update_steps = n_cycles * 2 * n_s_initial # Note: Your dynamic n_s handles the doubling
         steps_per_epoch = n_train // n_batch
-        total_update_steps = n_cycles * 2 * n_s
         n_epochs = int(total_update_steps / steps_per_epoch)
 
-        start_time = time.time()
-        
-        # We only need the trained model
-        model_trained, _, _, _, _, _, _, _ = miniBatchGradientDescentConv(
-            MX_train, train_y, MX_val, val_y, 
+        model_trained, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescentConv(
+            MX_train_ext, train_y, MX_val_ext, val_y, 
             n_batch=n_batch, 
             n_epochs=n_epochs, 
-            conv_model=conv_model, 
+            conv_model=conv_model_ext, 
             lam=lam, 
-            n_s=n_s, 
-            seed=randseed
+            n_s=n_s_initial, 
+            seed=randseed,
+            epsilon=0.1
         )
         
-        end_time = time.time()
-        run_time = end_time - start_time
-
-        # 5. Evaluate and Record
-        test_acc = evaluate_model_accuracy(MX_test, test_y, model_trained)
+        test_acc = evaluate_model_accuracy(MX_test_ext, test_y, model_trained)
+        print(f"--> Final Test Accuracy for {model_name}: {test_acc * 100:.2f}%")
         
-        print(f"--> Final Test Accuracy: {test_acc * 100:.2f}%")
-        print(f"--> Training Time: {run_time:.2f} seconds")
+        # Plot the specific curves for this run as required by the assignment
+        print(f"Generating plots for {model_name}...")
+        plot_training_curves(update_steps, train_losses, val_losses, train_accs, val_accs)
 
-        test_accuracies.append(test_acc * 100)
-        training_times.append(run_time)
-        plot_labels.append(f"f={f_val}\nnf={num_filters}")
-
-
-    # GENERATE BAR CHARTS
-
-    print("\nGenerating performance charts...")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    colors = ['#4c72b0', '#55a868', '#c44e52', '#8172b2'] # Nice professional color palette
-
-    # Chart 1: Accuracy
-    bars1 = ax1.bar(plot_labels, test_accuracies, color=colors)
-    ax1.set_title('Final Test Performance by Architecture', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Test Accuracy (%)', fontsize=12)
-    ax1.set_ylim(0, 100) # Lock y-axis to 100% for context
-    ax1.grid(axis='y', linestyle='--', alpha=0.7)
-    
-    # Add percentage labels on top of bars
-    for bar in bars1:
-        yval = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width()/2, yval + 1.5, f"{yval:.1f}%", ha='center', va='bottom', fontsize=10)
-
-    # Chart 2: Time
-    bars2 = ax2.bar(plot_labels, training_times, color=colors)
-    ax2.set_title('Training Time by Architecture', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Time (seconds)', fontsize=12)
-    ax2.grid(axis='y', linestyle='--', alpha=0.7)
-
-    # Add time labels on top of bars
-    for bar in bars2:
-        yval = bar.get_height()
-        max_time = max(training_times)
-        ax2.text(bar.get_x() + bar.get_width()/2, yval + (max_time * 0.02), f"{yval:.1f}s", ha='center', va='bottom', fontsize=10)
-
-    plt.tight_layout()
-    plt.show()
-
-
-
-    # n_batch = 100
-    # n_train = train_X.shape[0] 
-    # n_s = 2 * (n_train // n_batch) # Calculate step size dynamically 
-    # n_epochs = 12 # n_batch = 100 => 450 update steps, n_s = 2* n/n_batch = 900 => 4 epochs per cycle * 3 cycles = 12 epochs
-
-    
-    
-    # m = 50 
-    # dims = [[m, train_X.shape[1]],
-    #         [len(np.unique(train_y)), m]]  
-
-    # # n_epochs_search = 8 # n_batch = 100 => 450 update steps, n_s = 2* n/n_batch = 900 => 4 epochs per cycle * 2 cycles = 8 epochs
-    # # search_amount = 10
-
-    # # Coarse search, ran multiple times with differnet seeds to get a good range for the fine search
-    # # search_results = lambda_search(n_s, dims, train_X, train_y, val_X, val_y, search_range=(-5,-1), seed=randseed, search_amount=search_amount, n_epochs=n_epochs)
-    # # print("\nLambda Search Results (sorted by validation accuracy):")
-    # # for lam, val_acc in search_results:
-    # #     print(f"Lambda: {lam:.2e}, Best Validation Accuracy: {val_acc * 100:.2f}%")
-
-    # # Fine search 
-    # # search_results_fine = lambda_search(n_s, dims, train_X, train_y, val_X, val_y, search_range=(-4.7,-3.5), seed=randseed, search_amount=search_amount+10, n_epochs=n_epochs*2)
-    # # print("\nLambda Search Results (sorted by validation accuracy):")
-    # # for lam, val_acc in search_results_fine:
-    # #     print(f"Lambda: {lam:.2e}, Best Validation Accuracy: {val_acc * 100:.2f}%")
-
-
-
-
-
-    # model = initializeModel(dims, seed=randseed)
-    # trained_model, train_costs, val_costs, train_losses, val_losses, train_accs, val_accs, update_steps = miniBatchGradientDescent(
-    #         train_X, train_y, val_X, val_y, n_batch=100, learningRateCalc="cyclical", n_epochs=n_epochs, model=model, n_s=n_s, lam=2.64e-04, seed=randseed)
-    
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
